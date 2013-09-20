@@ -197,6 +197,7 @@ class PersistentCache(object):
 class PackageManager(BasePackageManager):
     """The default package manager that goes to PyPI and caches locally."""
     dep_cache_file = os.path.join(os.path.expanduser('~'), '.pip-tools', 'dependencies.pickle')
+    dep_links_cache_file = os.path.join(os.path.expanduser('~'), '.pip-tools', 'dep_links.pickle')
     download_cache_root = os.path.join(os.path.expanduser('~'), '.pip-tools', 'cache')
 
     def __init__(self):
@@ -205,6 +206,7 @@ class PackageManager(BasePackageManager):
             os.makedirs(self.download_cache_root)
         self._link_cache = {}
         self._dep_cache = PersistentCache(self.dep_cache_file)
+        self._dep_links_cache = PersistentCache(self.dep_links_cache_file)
         self._dep_call_cache = {}
         self._best_match_call_cache = {}
 
@@ -250,13 +252,15 @@ class PackageManager(BasePackageManager):
                 finder = PackageFinder(
                     find_links=[],
                     index_urls=['https://pypi.python.org/simple/'],
-                    use_mirrors=True,
-                    mirrors=[],
                 )
+                finder.add_dependency_links(list(self._dep_links_cache.get('all', [])))
                 link = finder.find_requirement(requirement, False)
                 self._link_cache[specline] = link
                 source = 'PyPI'
-            _, version = package_to_requirement(splitext(link.filename)[0]).split('==')
+            try:
+                _, version = package_to_requirement(splitext(link.filename)[0]).split('==')
+            except ValueError:
+                _, version = package_to_requirement(link.egg_fragment).split('==')
 
             # Take this moment to smartly insert the pinned variant of this
             # spec into the link_cache, too
@@ -286,8 +290,13 @@ class PackageManager(BasePackageManager):
             else:
                 spec = Spec.from_pinned(name, version)
                 path = self.get_or_download_package(str(spec))
-                deps = self.extract_dependencies(path)
+                deps, dependency_links = self.extract_dependencies(path)
                 self._dep_cache[(name, version)] = deps
+                # Put dependency links in cache, so pkmngr could find and download them
+                if dependency_links:
+                    dep_links_cache = self._dep_links_cache.get('all', set())
+                    dep_links_cache.update(dependency_links)
+                    self._dep_links_cache['all'] = dep_links_cache
                 source = 'package archive'
         if key not in self._dep_call_cache:
             logger.debug('  Found: %s (from %s)' % (deps, source))
@@ -405,17 +414,18 @@ class PackageManager(BasePackageManager):
         dist_dir = os.path.join(package_dir, name)
         name, version = package_to_requirement(name).split('==')
         if not self.has_egg_info(dist_dir):
-            return []
+            return [], []
 
         egg_info_dir = '{0}.egg-info'.format(name.replace('-', '_'))
         for dirpath, dirnames, _ in os.walk(dist_dir):
             if egg_info_dir in dirnames:
                 requires = os.path.join(dirpath, egg_info_dir,
                                         'requires.txt')
+                deps_links_filepath = os.path.join(dirpath, egg_info_dir, 'dependency_links.txt')
                 if os.path.exists(requires):
                     break
         else:  # requires.txt not found
-            return []
+            return [], []
 
         deps = []
         with open(requires, 'r') as requirements:
@@ -424,7 +434,17 @@ class PackageManager(BasePackageManager):
                 if dep == '[test]' or not dep:
                     break
                 deps.append(dep)
-        return deps
+
+        dependency_links = []
+        if os.path.exists(deps_links_filepath):
+            with open(deps_links_filepath) as f:
+                for requirement in f.readlines():
+                    dep = requirement.strip()
+                    if dep == '[test]' or not dep:
+                        break
+                    dependency_links.append(dep)
+
+        return deps, dependency_links
 
     def extract_dependencies(self, path):
         """Returns a list of string representations of dependencies for
@@ -436,11 +456,11 @@ class PackageManager(BasePackageManager):
             unpack_dir = os.path.join(build_dir, 'build')
             try:
                 self.unpack_archive(path, unpack_dir)
-                deps = self.read_package_requires_file(unpack_dir)
+                deps, dependency_links = self.read_package_requires_file(unpack_dir)
             finally:
                 shutil.rmtree(build_dir)
         logger.debug('Found: %s' % (deps,))
-        return deps
+        return deps, dependency_links
 
 
 if __name__ == '__main__':
